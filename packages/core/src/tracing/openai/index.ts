@@ -4,6 +4,7 @@ import { SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN } from '../../semanticAttributes';
 import { SPAN_STATUS_ERROR } from '../../tracing';
 import { startSpan, startSpanManual } from '../../tracing/trace';
 import type { Span, SpanAttributeValue } from '../../types-hoist/span';
+import { isThenable } from '../../utils/is';
 import {
   GEN_AI_EMBEDDINGS_INPUT_ATTRIBUTE,
   GEN_AI_INPUT_MESSAGES_ATTRIBUTE,
@@ -162,6 +163,74 @@ function addRequestAttributes(span: Span, params: Record<string, unknown>, opera
 }
 
 /**
+ * Creates a wrapped version of .withResponse() that replaces the data field
+ * with the instrumented result while preserving metadata (response, request_id).
+ */
+function createWithResponseWrapper<T>(
+  originalWithResponse: Promise<unknown>,
+  instrumentedPromise: Promise<T>,
+): Promise<unknown> {
+  return instrumentedPromise.then(async instrumentedResult => {
+    try {
+      const originalWrapper = await originalWithResponse;
+
+      // If it's a wrapper object with data property, replace data with instrumented result
+      if (originalWrapper && typeof originalWrapper === 'object' && 'data' in originalWrapper) {
+        return {
+          ...originalWrapper,
+          data: instrumentedResult,
+        };
+      }
+
+      // Otherwise return the instrumented result as-is
+      return instrumentedResult;
+    } catch (error) {
+      // If getting the original wrapper fails, capture the error but still throw
+      // This ensures errors are visible while still being tracked in Sentry
+      captureException(error, {
+        mechanism: {
+          handled: false,
+          type: 'auto.ai.openai',
+        },
+      });
+      throw error;
+    }
+  });
+}
+
+/**
+ * Wraps a promise-like object to preserve additional methods (like .withResponse())
+ */
+function wrapPromiseWithMethods<T>(originalPromiseLike: T, instrumentedPromise: Promise<Awaited<T>>): T {
+  // If the original result is not thenable, return the instrumented promise
+  if (!isThenable(originalPromiseLike)) {
+    return instrumentedPromise as T;
+  }
+
+  // Create a proxy that forwards Promise methods to instrumentedPromise
+  // and preserves additional methods from the original result
+  return new Proxy(originalPromiseLike, {
+    get(target: object, prop: string | symbol): unknown {
+      const useInstrumentedPromise = prop in Promise.prototype || prop === Symbol.toStringTag;
+      const source = useInstrumentedPromise ? instrumentedPromise : target;
+
+      const value = Reflect.get(source, prop) as unknown;
+
+      // Special handling for .withResponse() to preserve instrumentation
+      // .withResponse() returns { data: T, response: Response, request_id: string }
+      if (prop === 'withResponse' && typeof value === 'function') {
+        return function wrappedWithResponse(this: unknown): unknown {
+          const originalWithResponse = (value as (...args: unknown[]) => unknown).call(target);
+          return createWithResponseWrapper(originalWithResponse, instrumentedPromise);
+        };
+      }
+
+      return typeof value === 'function' ? value.bind(source) : value;
+    },
+  }) as T;
+}
+
+/**
  * Instrument a method with Sentry spans
  * Following Sentry AI Agents Manual Instrumentation conventions
  * @see https://docs.sentry.io/platforms/javascript/guides/node/tracing/instrumentation/ai-agents-module/#manual-instrumentation
@@ -172,7 +241,7 @@ function instrumentMethod<T extends unknown[], R>(
   context: unknown,
   options: OpenAiOptions,
 ): (...args: T) => Promise<R> {
-  return async function instrumentedMethod(...args: T): Promise<R> {
+  return function instrumentedMethod(...args: T): Promise<R> {
     const requestAttributes = extractRequestAttributes(args, methodPath);
     const model = (requestAttributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE] as string) || 'unknown';
     const operationName = getOperationName(methodPath);
@@ -180,77 +249,71 @@ function instrumentMethod<T extends unknown[], R>(
     const params = args[0] as Record<string, unknown> | undefined;
     const isStreamRequested = params && typeof params === 'object' && params.stream === true;
 
+    // Call the original method to get the result with all its methods
+    const originalResult = originalMethod.apply(context, args);
+
+    const spanConfig = {
+      name: `${operationName} ${model}${isStreamRequested ? ' stream-response' : ''}`,
+      op: getSpanOperation(methodPath),
+      attributes: requestAttributes as Record<string, SpanAttributeValue>,
+    };
+
+    let instrumentedPromise: Promise<R>;
+
     if (isStreamRequested) {
       // For streaming responses, use manual span management to properly handle the async generator lifecycle
-      return startSpanManual(
-        {
-          name: `${operationName} ${model} stream-response`,
-          op: getSpanOperation(methodPath),
-          attributes: requestAttributes as Record<string, SpanAttributeValue>,
-        },
-        async (span: Span) => {
-          try {
-            if (options.recordInputs && params) {
-              addRequestAttributes(span, params, operationName);
-            }
-
-            const result = await originalMethod.apply(context, args);
-
-            return instrumentStream(
-              result as OpenAIStream<ChatCompletionChunk | ResponseStreamingEvent>,
-              span,
-              options.recordOutputs ?? false,
-            ) as unknown as R;
-          } catch (error) {
-            // For streaming requests that fail before stream creation, we still want to record
-            // them as streaming requests but end the span gracefully
-            span.setStatus({ code: SPAN_STATUS_ERROR, message: 'internal_error' });
-            captureException(error, {
-              mechanism: {
-                handled: false,
-                type: 'auto.ai.openai.stream',
-                data: {
-                  function: methodPath,
-                },
-              },
-            });
-            span.end();
-            throw error;
+      instrumentedPromise = startSpanManual(spanConfig, async (span: Span) => {
+        try {
+          if (options.recordInputs && params) {
+            addRequestAttributes(span, params, operationName);
           }
-        },
-      );
+
+          const result = await originalResult;
+
+          return instrumentStream(
+            result as OpenAIStream<ChatCompletionChunk | ResponseStreamingEvent>,
+            span,
+            options.recordOutputs ?? false,
+          ) as unknown as R;
+        } catch (error) {
+          // For streaming requests that fail before stream creation, end the span gracefully
+          span.setStatus({ code: SPAN_STATUS_ERROR, message: 'internal_error' });
+          captureException(error, {
+            mechanism: {
+              handled: false,
+              type: 'auto.ai.openai.stream',
+              data: { function: methodPath },
+            },
+          });
+          span.end();
+          throw error;
+        }
+      });
     } else {
-      //  Non-streaming responses
-      return startSpan(
-        {
-          name: `${operationName} ${model}`,
-          op: getSpanOperation(methodPath),
-          attributes: requestAttributes as Record<string, SpanAttributeValue>,
-        },
-        async (span: Span) => {
-          try {
-            if (options.recordInputs && params) {
-              addRequestAttributes(span, params, operationName);
-            }
-
-            const result = await originalMethod.apply(context, args);
-            addResponseAttributes(span, result, options.recordOutputs);
-            return result;
-          } catch (error) {
-            captureException(error, {
-              mechanism: {
-                handled: false,
-                type: 'auto.ai.openai',
-                data: {
-                  function: methodPath,
-                },
-              },
-            });
-            throw error;
+      // Non-streaming responses
+      instrumentedPromise = startSpan(spanConfig, async (span: Span) => {
+        try {
+          if (options.recordInputs && params) {
+            addRequestAttributes(span, params, operationName);
           }
-        },
-      );
+
+          const result = await originalResult;
+          addResponseAttributes(span, result, options.recordOutputs);
+          return result;
+        } catch (error) {
+          captureException(error, {
+            mechanism: {
+              handled: false,
+              type: 'auto.ai.openai',
+              data: { function: methodPath },
+            },
+          });
+          throw error;
+        }
+      });
     }
+
+    return wrapPromiseWithMethods(originalResult, instrumentedPromise);
   };
 }
 
